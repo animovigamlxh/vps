@@ -1,23 +1,42 @@
 #!/bin/bash
 
-# ================= 配置区 =================
-# 1. 在这里填入你的 TG 机器人信息
-TG_BOT_TOKEN="你的_BOT_TOKEN"
-TG_CHAT_ID="你的_CHAT_ID"
-
-# 2. 定义监控脚本的路径和文件名
-MONITOR_SCRIPT="/usr/local/bin/speedtest_monitor.sh"
-# 定时任务：每12小时运行一次
-CRON_JOB="0 */12 * * * sudo $MONITOR_SCRIPT > /dev/null 2>&1"
-# ==========================================
-
 # --- 检查是否以root用户运行 ---
 if [[ "$EUID" -ne 0 ]]; then
   echo "此脚本必须以root用户身份运行。请使用 sudo。"
   exit 1
 fi
 
-echo "--- 正在创建带防误判（连续3次触发）功能的监控脚本 ${MONITOR_SCRIPT} ---"
+# ================= 交互式输入配置 =================
+echo "=========================================="
+echo "    欢迎使用 v2node 测速与自动开关配置脚本"
+echo "=========================================="
+
+read -p "1. 请输入你的 Telegram Bot Token: " TG_BOT_TOKEN
+read -p "2. 请输入你的 Telegram Chat ID: " TG_CHAT_ID
+
+if [ -z "$TG_BOT_TOKEN" ] || [ -z "$TG_CHAT_ID" ]; then
+    echo "❌ 错误：Token 和 Chat ID 不能为空，请重新运行脚本！"
+    exit 1
+fi
+
+# 交互式设定测速阈值
+read -p "3. 请输入达标阈值 (单位: Mbps，默认 100): " INPUT_THRESHOLD
+THRESHOLD_MBPS=${INPUT_THRESHOLD:-100}
+
+# 交互式设定连续触发次数
+read -p "4. 请输入连续触发次数 (默认 3 次): " INPUT_MAX_COUNT
+MAX_COUNT=${INPUT_MAX_COUNT:-3}
+
+MONITOR_SCRIPT="/usr/local/bin/speedtest_monitor.sh"
+CRON_JOB="0 */12 * * * sudo $MONITOR_SCRIPT > /dev/null 2>&1"
+
+echo ""
+echo "--- 当前设置配置 ---"
+echo "Telegram Chat ID : $TG_CHAT_ID"
+echo "带宽达标阈值     : ${THRESHOLD_MBPS} Mbps"
+echo "连续判断次数     : ${MAX_COUNT} 次"
+echo "--------------------"
+echo "正在生成监控脚本 ${MONITOR_SCRIPT} ..."
 
 # 写入子脚本内容
 cat > "$MONITOR_SCRIPT" << EOF
@@ -27,17 +46,21 @@ cat > "$MONITOR_SCRIPT" << EOF
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 # --- 参数配置 ---
-threshold_mbps=100      # 判定阈值 (Mbps)
-test_file_size=10       # 测试文件大小 (MB)
+threshold_mbps=${THRESHOLD_MBPS} # 判定阈值 (Mbps)
+MAX_COUNT=${MAX_COUNT}           # 连续触发阈值次数
+test_file_size=10                # 测试文件大小 (MB)
 test_url="https://speed.cloudflare.com/__down?bytes=10485760" 
-MAX_COUNT=3             # 连续触发阈值次数
-STATE_FILE="/tmp/speedtest_fail_count"  # 存储连续失败/成功计数的临时文件
+STATE_FILE="/tmp/speedtest_fail_count" # 存储连续失败/成功计数的临时文件
+
+# Telegram 配置
+TG_BOT_TOKEN="${TG_BOT_TOKEN}"
+TG_CHAT_ID="${TG_CHAT_ID}"
 
 # --- TG 通知函数 ---
 send_tg_msg() {
     local message=\$1
-    curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \\
-        -d "chat_id=${TG_CHAT_ID}" \\
+    curl -s -X POST "https://api.telegram.org/bot\${TG_BOT_TOKEN}/sendMessage" \\
+        -d "chat_id=\${TG_CHAT_ID}" \\
         -d "text=\$message" \\
         -d "parse_mode=Markdown"
 }
@@ -87,7 +110,6 @@ if [ "\$is_below" -eq 1 ]; then
 
     if [ "\$fail_count" -ge "\$MAX_COUNT" ]; then
         action="🔴 *连续 \${fail_count} 次低于阈值，已停止 v2node*"
-        # 如果未停止，则执行停止命令
         [[ ! "\$v2node_status" =~ "Stopped" && ! "\$v2node_status" =~ "not running" && ! "\$v2node_status" =~ "未运行" ]] && v2node stop
     else
         action="⚠️ *速度不达标 (\${fail_count}/\${MAX_COUNT} 次)*\\nv2node 保持当前状态，暂不关闭"
@@ -101,11 +123,10 @@ else
     fi
     echo "\$fail_count" > "\$STATE_FILE"
 
-    abs_pass_count=\${fail_count#-} # 取绝对值显示连续成功次数
+    abs_pass_count=\${fail_count#-}
 
     if [ "\$abs_pass_count" -ge "\$MAX_COUNT" ]; then
         action="✅ *连续 \${abs_pass_count} 次达标，v2node 启动/运行中*"
-        # 如果已停止，则执行开启命令
         [[ "\$v2node_status" =~ "Stopped" || "\$v2node_status" =~ "not running" || "\$v2node_status" =~ "未运行" ]] && v2node start
     else
         action="🟡 *速度已恢复达标 (\${abs_pass_count}/\${MAX_COUNT} 次)*\\nv2node 保持当前状态，待连续达标后再开启"
@@ -125,6 +146,6 @@ chmod +x "$MONITOR_SCRIPT"
 echo "--- 正在设置定时任务 ---"
 (crontab -l 2>/dev/null | grep -F "${MONITOR_SCRIPT}" | grep -v "grep") || (crontab -l 2>/dev/null; echo "$CRON_JOB") | crontab -
 
-echo "安装完成！"
-echo "监控脚本：$MONITOR_SCRIPT"
-echo "已更新为控制 v2node 服务，并启用连续 3 次判定机制。"
+echo "✅ 安装完成！"
+echo "监控脚本存放在：$MONITOR_SCRIPT"
+echo "你可以直接执行 sudo $MONITOR_SCRIPT 立即运行一次测试。"
