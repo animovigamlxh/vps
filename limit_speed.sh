@@ -1,4 +1,3 @@
-bash <(cat << 'EOF'
 #!/bin/bash
 
 # --- 检查是否以root用户运行 ---
@@ -7,175 +6,128 @@ if [[ "$EUID" -ne 0 ]]; then
   exit 1
 fi
 
-# ================= 交互式输入配置 =================
+# ================= 1. 交互式输入配置 =================
 echo "=========================================="
-echo "    欢迎使用 v2node 测速与自动开关配置脚本"
+echo "    欢迎使用节点测速与自动开关配置脚本"
 echo "=========================================="
 
-read -p "1. 请输入你的 Telegram Bot Token: " TG_BOT_TOKEN
-read -p "2. 请输入你的 Telegram Chat ID: " TG_CHAT_ID
+read -p "1. 请输入你的 Telegram Bot Token: " TOKEN
+read -p "2. 请输入你的 Telegram Chat ID: " CHAT_ID
 
-if [ -z "$TG_BOT_TOKEN" ] || [ -z "$TG_CHAT_ID" ]; then
+if [ -z "$TOKEN" ] || [ -z "$CHAT_ID" ]; then
     echo "❌ 错误：Token 和 Chat ID 不能为空，请重新运行脚本！"
     exit 1
 fi
 
-# 交互式设定测速阈值
-read -p "3. 请输入达标阈值 (单位: Mbps，默认 100): " INPUT_THRESHOLD
-THRESHOLD_MBPS=${INPUT_THRESHOLD:-100}
+read -p "3. 请输入带宽判定阈值 (Mbps, 默认 100): " threshold_mbps
+threshold_mbps=${threshold_mbps:-100}
 
-# 交互式设定连续触发次数
-read -p "4. 请输入连续触发次数 (默认 3 次): " INPUT_MAX_COUNT
-MAX_COUNT=${INPUT_MAX_COUNT:-3}
+read -p "4. 请输入当前节点显示名称 (默认获取系统主机名): " node_name
+node_name=${node_name:-$(hostname)}
+
+read -p "5. 请输入执行间隔 (分钟, 默认 59): " interval_min
+interval_min=${interval_min:-59}
 
 MONITOR_SCRIPT="/usr/local/bin/speedtest_monitor.sh"
-CRON_JOB="0 */12 * * * sudo $MONITOR_SCRIPT > /dev/null 2>&1"
 
 echo ""
 echo "--- 当前设置配置 ---"
-echo "Telegram Chat ID : $TG_CHAT_ID"
-echo "带宽达标阈值     : ${THRESHOLD_MBPS} Mbps"
-echo "连续判断次数     : ${MAX_COUNT} 次"
+echo "Telegram Chat ID : $CHAT_ID"
+echo "节点显示名称     : $node_name"
+echo "带宽达标阈值     : ${threshold_mbps} Mbps"
+echo "执行间隔         : ${interval_min} 分钟"
 echo "--------------------"
 echo "正在生成监控脚本 ${MONITOR_SCRIPT} ..."
 
-# 写入子脚本内容（已修复负数计数校验 Bug）
-cat << 'SUBEOF' > "$MONITOR_SCRIPT"
+# ================= 2. 写入监控脚本 =================
+cat > "$MONITOR_SCRIPT" << EOF
 #!/bin/bash
-
-# 环境变量设置
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
-# --- 参数配置 ---
-threshold_mbps=${THRESHOLD_MBPS}
-MAX_COUNT=${MAX_COUNT}
-test_file_size=10
-test_url="https://speed.cloudflare.com/__down?bytes=10485760"
-STATE_FILE="/tmp/speedtest_fail_count"
+TOKEN="$TOKEN"
+CHAT_ID="$CHAT_ID"
+NODE_NAME="$node_name"
+THRESHOLD="$threshold_mbps"
 
-# Telegram 配置
-TG_BOT_TOKEN="${TG_BOT_TOKEN}"
-TG_CHAT_ID="${TG_CHAT_ID}"
+STATUS_FILE="/tmp/node_speed_status.txt"
+COUNT_FILE="/tmp/node_check_count.txt"
+TEST_URL="https://speed.cloudflare.com/__down?bytes=10485760"
+TEST_FILE_SIZE=10
 
-# --- TG 通知函数 ---
+[ ! -f "$STATUS_FILE" ] && echo "1" > "$STATUS_FILE"
+[ ! -f "$COUNT_FILE" ] && echo "0" > "$COUNT_FILE"
+old_status=\$(cat "$STATUS_FILE")
+current_count=\$(cat "$COUNT_FILE")
+
 send_tg_msg() {
-    local message="\$1"
-    if [ -n "\$TG_BOT_TOKEN" ] && [ -n "\$TG_CHAT_ID" ]; then
-        curl -s -X POST "https://api.telegram.org/bot\${TG_BOT_TOKEN}/sendMessage" \
-            -d "chat_id=\${TG_CHAT_ID}" \
-            -d "text=\${message}" \
-            -d "parse_mode=Markdown" > /dev/null
-    fi
+    curl -s -X POST "https://api.telegram.org/bot\${TOKEN}/sendMessage" \\
+        -d "chat_id=\${CHAT_ID}" \\
+        -d "text=\$1" \\
+        -d "parse_mode=Markdown"
 }
 
-# --- 依赖检查 ---
-for pkg in curl bc; do
-    if ! command -v "\$pkg" &> /dev/null; then
-        apt-get update && apt-get install -y "\$pkg"
-    fi
-done
+# 测速
+do_speedtest() {
+    local start=\$(date +%s.%N)
+    local code=\$(curl -s -o /dev/null -w "%{http_code}" --max-time 20 "\$TEST_URL")
+    if [ "\$code" -ne 200 ]; then echo "0.00"; return; fi
+    local end=\$(date +%s.%N)
+    local duration=\$(echo "\$end - \$start" | bc)
+    echo "scale=2; (\$TEST_FILE_SIZE * 8) / \$duration" | bc | awk '{if(\$1=="") print "0.00"; else print \$1}'
+}
 
-# 读取当前计数
-if [ -f "\$STATE_FILE" ]; then
-    fail_count=\$(cat "\$STATE_FILE")
-else
-    fail_count=0
-fi
+speed=\$(do_speedtest)
+[ -z "\$speed" ] && speed="0.00"
 
-# 修复：允许负号开头的合法数字通过校验，防止负数被清零
-case "\$fail_count" in
-    ''|*[!0-9-]*) fail_count=0 ;;
-esac
+# 比较
+is_low=\$(awk -v s="\$speed" -v t="\$THRESHOLD" 'BEGIN {print (s < t) ? 1 : 0}')
 
-# --- 核心测速逻辑 ---
-start_time=\$(date +%s.%N)
-http_code=\$(curl -s -o /dev/null -w "%{http_code}" "\$test_url")
-
-if [ "\$http_code" -ne 200 ]; then
-    msg="⚠️ 测速异常%0A节点：\$(hostname)%0A状态：测速文件下载失败 (HTTP \$http_code)"
-    send_tg_msg "\$msg"
-    exit 1
-fi
-
-end_time=\$(date +%s.%N)
-duration=\$(echo "\$end_time - \$start_time" | bc)
-download_speed_mbps=\$(echo "scale=2; (\$test_file_size * 8) / \$duration" | bc)
-
-# 获取当前 v2node 服务运行状态
-v2node_status=\$(v2node status 2>&1)
-
-# --- 防抖动与状态切换逻辑 ---
-is_below=\$(echo "\$download_speed_mbps < \$threshold_mbps" | bc -l)
-
-if [ "\$is_below" -eq 1 ]; then
-    # 速度低于阈值 (累加正数)
-    if [ "\$fail_count" -lt 0 ]; then
-        fail_count=1
+if [ "\$is_low" -eq 1 ]; then
+    # --- 情况 A: 速度【不达标】 ---
+    if [ "\$current_count" -gt 0 ]; then
+        new_count=-1  # 如果之前是达标的，现在立刻反转为失败1次
     else
-        fail_count=\$((fail_count + 1))
+        new_count=\$((current_count - 1)) # 持续失败，累计负数
     fi
+    # 限制计数器下限，防止无限减小
+    [ "\$new_count" -lt -5 ] && new_count=-5
+    echo "\$new_count" > "\$COUNT_FILE"
     
-    # 封顶：最大不超过 MAX_COUNT
-    [ "\$fail_count" -gt "\$MAX_COUNT" ] && fail_count="\$MAX_COUNT"
-    
-    echo "\$fail_count" > "\$STATE_FILE"
-
-    if [ "\$fail_count" -ge "\$MAX_COUNT" ]; then
-        action="🔴 连续 \${fail_count} 次低于阈值，已停止 v2node"
-        if ! echo "\$v2node_status" | grep -qE "Stopped|not running|未运行"; then
-            v2node stop
-        fi
-    else
-        action="⚠️ 速度不达标 (\${fail_count}/\${MAX_COUNT} 次)，v2node 保持当前状态"
+    # 触发关闭：连续 3 次失败且当前开启
+    if [ "\$new_count" -le -3 ] && [ "\$old_status" == "1" ]; then
+        xrayr stop &>/dev/null; v2bx stop &>/dev/null; v2node stop &>/dev/null
+        echo "0" > "\$STATUS_FILE"
+        msg=\$(echo -e "⚠️ 节点异常报警\n节点：\${NODE_NAME}\n状态：连续 3 次不达标\n速度：\$speed Mbps\n动作：🔴 停止服务")
+        send_tg_msg "\$msg"
     fi
 else
-    # 速度高于阈值 (累加负数，用绝对值表示成功次数)
-    if [ "\$fail_count" -gt 0 ]; then
-        fail_count=-1
+    # --- 情况 B: 速度【达标】 ---
+    if [ "\$current_count" -lt 0 ]; then
+        new_count=1   # 如果之前是不达标的，现在立刻反转为成功1次
     else
-        fail_count=\$((fail_count - 1))
+        new_count=\$((current_count + 1)) # 持续达标，累计正数
     fi
-    
-    # 封顶：绝对值最大不超过 MAX_COUNT
-    min_limit=\$(( -MAX_COUNT ))
-    [ "\$fail_count" -lt "\$min_limit" ] && fail_count="\$min_limit"
-    
-    echo "\$fail_count" > "\$STATE_FILE"
+    # 限制计数器上限，防止无限增加 (最高到 5)
+    [ "\$new_count" -gt 5 ] && new_count=5
+    echo "\$new_count" > "\$COUNT_FILE"
 
-    # 去掉负号计算绝对值
-    abs_pass_count=\${fail_count#-}
-
-    if [ "\$abs_pass_count" -ge "\$MAX_COUNT" ]; then
-        action="✅ 连续 \${abs_pass_count} 次达标，v2node 启动/运行中"
-        if echo "\$v2node_status" | grep -qE "Stopped|not running|未运行"; then
-            v2node start
-        fi
-    else
-        action="🟡 速度已恢复达标 (\${abs_pass_count}/\${MAX_COUNT} 次)，待连续达标后再开启"
+    # 触发开启：连续 3 次成功且当前关闭
+    if [ "\$new_count" -ge 3 ] && [ "\$old_status" == "0" ]; then
+        xrayr start &>/dev/null; v2bx start &>/dev/null; v2node start &>/dev/null
+        echo "1" > "\$STATUS_FILE"
+        msg=\$(echo -e "✅ 节点恢复报告\n节点：\${NODE_NAME}\n状态：连续 3 次已达标\n速度：\$speed Mbps\n动作：🟢 开启服务")
+        send_tg_msg "\$msg"
     fi
 fi
+EOF
 
-# --- 发送最终执行结果 ---
-final_msg="📊 节点测速报告%0A--------------------%0A节点名称：\$(hostname)%0A实测带宽：\${download_speed_mbps} Mbps%0A判定阈值：\${threshold_mbps} Mbps%0A当前动作：\${action}"
-send_tg_msg "\$final_msg"
-SUBEOF
-
-# 动态替换子脚本中的变量占位符
-sed -i "s/\${TG_BOT_TOKEN}/${TG_BOT_TOKEN}/g" "$MONITOR_SCRIPT"
-sed -i "s/\${TG_CHAT_ID}/${TG_CHAT_ID}/g" "$MONITOR_SCRIPT"
-sed -i "s/\${THRESHOLD_MBPS}/${THRESHOLD_MBPS}/g" "$MONITOR_SCRIPT"
-sed -i "s/\${MAX_COUNT}/${MAX_COUNT}/g" "$MONITOR_SCRIPT"
-
-# 赋予执行权限
+# --- 3. 设置权限与定时任务 ---
 chmod +x "$MONITOR_SCRIPT"
 
-# --- 设置定时任务 ---
-echo "--- 正在设置定时任务 ---"
-(crontab -l 2>/dev/null | grep -F "${MONITOR_SCRIPT}" | grep -v "grep") || (crontab -l 2>/dev/null; echo "$CRON_JOB") | crontab -
+# 设置 Cron (兼容清理旧任务并写入新任务)
+(crontab -l 2>/dev/null | grep -v "speedtest_monitor.sh"; echo "*/$interval_min * * * * /usr/local/bin/speedtest_monitor.sh > /dev/null 2>&1") | crontab -
 
 echo ""
 echo "✅ 安装完成！"
-echo "监控脚本存放在：$MONITOR_SCRIPT"
+echo "监控脚本已存放在：$MONITOR_SCRIPT"
 echo "你可以直接执行 sudo $MONITOR_SCRIPT 立即运行一次测试。"
-EOF
-)
